@@ -136,7 +136,7 @@ class XWindowInterface(AbstractWindowInterface):
 
     def get_window_class(self, window=None, traverse=True) -> str:
         return self.get_window_info(window, traverse).wm_class
-    
+
     def _get_window_info(self, window, traverse: bool, wm_title: str=None, wm_class: str=None) -> WindowInfo:
         new_wm_title = self._try_get_window_title(window)
         new_wm_class = self._try_get_window_class(window)
@@ -280,9 +280,9 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
     @queue_method(queue)
     def press_key(self, keyName):
         """
-        Press passed keyName. 
+        Press passed keyName.
 
-        :param keyName: 
+        :param keyName:
         """
         self.__sendKeyPressEvent(self.__lookupKeyCode(keyName), 0)
 
@@ -994,20 +994,67 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
 
     def __flush_events(self):
         readable, _, _ = select.select([self.localDisplay], [], [], 1)
-        time.sleep(1)
         if self.localDisplay in readable:
             createdWindows = []
             destroyedWindows = []
 
             for _ in range(self.localDisplay.pending_events()):
-                event = self.localDisplay.next_event()
-                if event.type == X.CreateNotify:
-                    createdWindows.append(event.window)
-                if event.type == X.DestroyNotify:
-                    destroyedWindows.append(event.window)
-                if event.type == X.MappingNotify:
+                evt = self.localDisplay.next_event()
+                if evt.type == X.CreateNotify:
+                    createdWindows.append(evt.window)
+                if evt.type == X.DestroyNotify:
+                    destroyedWindows.append(evt.window)
+                if evt.type == X.MappingNotify:
                     logger.debug("X Mapping Event Detected")
                     self.on_keys_changed()
+                if evt.type == X.KeyPress or evt.type == X.KeyRelease:
+                    keyCode = evt.detail
+                    rawKey = self.lookup_string(keyCode, False, False, False)
+
+                    logLevel = logging.DEBUG
+                    if logger.isEnabledFor(logLevel):
+                        # Only do all this extra work when we actually need it
+                        action = evt.__class__.__name__
+                        keySym = self.localDisplay.keycode_to_keysym(keyCode, 0)
+                        shifted = bool(evt.state & self.modMasks[Key.SHIFT]) ^ bool(evt.state & self.modMasks[Key.CAPSLOCK])
+                        numlock = bool(evt.state & self.modMasks[Key.NUMLOCK])
+                        altGrid = bool(evt.state & self.modMasks[Key.ALT_GR])
+                        key = self.lookup_string(keyCode, shifted, numlock, altGrid)
+                        modifiers = [k.value for k, v in self.modMasks.items() if evt.state & v]
+                        logger.log(logLevel, "Event type: {}, keyCode: {}, keySym: {}, key: {}, rawKey: {}, modifiers: {}".format(action, keyCode, keySym, key, rawKey, modifiers))
+
+                    if evt.type == X.KeyRelease and rawKey in HELD_MODIFIERS:
+                        # If we let go of the modifier key while the hotkey is pressed,
+                        # the KeyRelease event for the modifier ends up here and is lost
+                        # to the application. This results in stuck modifier keys.
+                        # We rectify this problem by sending the KeyRelease event to the focused window.
+
+                        logger.debug("Pass modifier key {} release event through to focused window".format(rawKey))
+
+                        focus = self.localDisplay.get_input_focus().focus
+
+                        new_event = event.KeyRelease(
+                            detail=evt.detail,
+                            time=evt.time,
+                            root=evt.root,
+                            window=focus, # Note: evt.window does not work here because X redirected the event to the window passed to the grab_key call
+                            child=evt.child,
+                            root_x=evt.root_x,
+                            root_y=evt.root_y,
+                            event_x=evt.event_x,
+                            event_y=evt.event_y,
+                            state=evt.state,
+                            same_screen=evt.same_screen
+                        )
+
+                        self.localDisplay.send_event(
+                            destination=focus, # Note: evt.window does not work here (see above)
+                            propagate=True,
+                            event_mask=X.KeyReleaseMask,
+                            event=new_event
+                        )
+
+                        self.localDisplay.flush()
 
             for window in createdWindows:
                 if window not in destroyedWindows:
@@ -1197,7 +1244,7 @@ import autokey.configmanager.configmanager as cm
 XK.load_keysym_group('xkb')
 
 XK_TO_AK_MAP = {
-    
+
     # XK.XK_Shift_L: Key.SHIFT,
     XK.XK_Shift_L: Key.LEFTSHIFT,
     XK.XK_Shift_R: Key.RIGHTSHIFT,
@@ -1209,7 +1256,7 @@ XK_TO_AK_MAP = {
     # XK.XK_Alt_L: Key.ALT,
     XK.XK_Alt_L: Key.LEFTALT,
     XK.XK_Alt_R: Key.RIGHTALT,
-    
+
     # XK.XK_Super_L: Key.SUPER,
     XK.XK_Super_L: Key.LEFTSUPER,
     XK.XK_Super_R: Key.RIGHTSUPER,
