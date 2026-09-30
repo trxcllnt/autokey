@@ -1170,7 +1170,6 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
 
     def __flush_events(self):
         readable, _, _ = select.select([self.localDisplay], [], [], 1)
-        time.sleep(1)
         if self.localDisplay in readable:
             createdWindows = []
             destroyedWindows = []
@@ -1184,6 +1183,54 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
                 if event.type == X.MappingNotify:
                     logger.debug("X Mapping Event Detected")
                     self.on_keys_changed()
+                if event.type == X.KeyPress or event.type == X.KeyRelease:
+                    keyCode = event.detail
+                    rawKey = self.lookup_string(keyCode, False, False, False)
+
+                    logLevel = logging.DEBUG
+                    if logger.isEnabledFor(logLevel):
+                        # Only do all this extra work when we actually need it
+                        action = event.__class__.__name__
+                        keySym = self.localDisplay.keycode_to_keysym(keyCode, 0)
+                        shifted = bool(event.state & self.modMasks[Key.SHIFT]) ^ bool(event.state & self.modMasks[Key.CAPSLOCK])
+                        numlock = bool(event.state & self.modMasks[Key.NUMLOCK])
+                        altGrid = bool(event.state & self.modMasks[Key.ALT_GR])
+                        key = self.lookup_string(keyCode, shifted, numlock, altGrid)
+                        modifiers = [k.value for k, v in self.modMasks.items() if event.state & v]
+                        logger.log(logLevel, "Event type: {}, keyCode: {}, keySym: {}, key: {}, rawKey: {}, modifiers: {}".format(action, keyCode, keySym, key, rawKey, modifiers))
+
+                    if event.type == X.KeyRelease and rawKey in HELD_MODIFIERS:
+                        # If we let go of the modifier key while the hotkey is pressed,
+                        # the KeyRelease event for the modifier ends up here and is lost
+                        # to the application. This results in stuck modifier keys.
+                        # We rectify this problem by sending the KeyRelease event to the focused window.
+
+                        logger.debug("Pass modifier key {} release event through to focused window".format(rawKey))
+
+                        focus = self.localDisplay.get_input_focus().focus
+
+                        new_event = event.KeyRelease(
+                            detail=event.detail,
+                            time=event.time,
+                            root=event.root,
+                            window=focus, # Note: event.window does not work here because X redirected the event to the window passed to the grab_key call
+                            child=event.child,
+                            root_x=event.root_x,
+                            root_y=event.root_y,
+                            event_x=event.event_x,
+                            event_y=event.event_y,
+                            state=event.state,
+                            same_screen=event.same_screen
+                        )
+
+                        self.localDisplay.send_event(
+                            destination=focus, # Note: event.window does not work here (see above)
+                            propagate=True,
+                            event_mask=X.KeyReleaseMask,
+                            event=new_event
+                        )
+
+                        self.localDisplay.flush()
 
             for window in createdWindows:
                 if window not in destroyedWindows:
@@ -1393,7 +1440,7 @@ class AtSpiInterface(XInterfaceBase, AbstractSysInterface):
         return True
 
 
-from autokey.model.key import Key, MODIFIERS
+from autokey.model.key import Key, HELD_MODIFIERS, MODIFIERS
 import autokey.configmanager.configmanager as cm
 
 XK.load_keysym_group('xkb')
