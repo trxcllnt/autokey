@@ -119,34 +119,36 @@ class XWindowInterface(AbstractWindowInterface):
 
     def __init__(self):
         self.localDisplay = display.Display()
+        self.xlib_lock = threading.Lock()
         # Window name atoms
         self.__NameAtom = self.localDisplay.intern_atom("_NET_WM_NAME", True)
         self.__VisibleNameAtom = self.localDisplay.intern_atom("_NET_WM_VISIBLE_NAME", True)
 
     def get_window_info(self, window=None, traverse: bool=True) -> WindowInfo:
-        try:
-            if window is None:
-                window = self.localDisplay.get_input_focus().focus
-            # get_input_focus() can return the X11 protocol's special None
-            # (0) or PointerRoot (1) focus values instead of a real window
-            # -- e.g. no window currently has explicit input focus, such as
-            # during a focus-follows-mouse transition. python-xlib has no
-            # window resource to wrap in that case and returns the raw int
-            # as-is, which crashes downstream .get_property() calls with an
-            # uncaught AttributeError (confirmed live: 'int' object has no
-            # attribute 'get_property'). Treat it the same as an unknown
-            # window rather than letting it propagate.
-            if isinstance(window, int):
+        with self.xlib_lock:
+            try:
+                if window is None:
+                    window = self.localDisplay.get_input_focus().focus
+                # get_input_focus() can return the X11 protocol's special None
+                # (0) or PointerRoot (1) focus values instead of a real window
+                # -- e.g. no window currently has explicit input focus, such as
+                # during a focus-follows-mouse transition. python-xlib has no
+                # window resource to wrap in that case and returns the raw int
+                # as-is, which crashes downstream .get_property() calls with an
+                # uncaught AttributeError (confirmed live: 'int' object has no
+                # attribute 'get_property'). Treat it the same as an unknown
+                # window rather than letting it propagate.
+                if isinstance(window, int):
+                    return self._create_window_info(window, "", "")
+                return self._get_window_info(window, traverse)
+            except error.BadWindow:
+                logger.warning("Got BadWindow error while requesting window information.")
                 return self._create_window_info(window, "", "")
-            return self._get_window_info(window, traverse)
-        except error.BadWindow:
-            logger.warning("Got BadWindow error while requesting window information.")
-            return self._create_window_info(window, "", "")
-            
+
     #  Add missing get_window_list() method required by AbstractWindowInterface
     #
     #  Not sure if this ever gets called but this is a best guess, based off
-    #  the gnome_autokey_extension List() function for the return data structure 
+    #  the gnome_autokey_extension List() function for the return data structure
     #  and the autokey.scripting.window.get_window_list() method's use of wmctrl.
     def get_window_list(self, filter_desktop=-1):
         try:
@@ -177,13 +179,13 @@ class XWindowInterface(AbstractWindowInterface):
             })
         logger.debug('autokey.interface.get_window_list(filter_desktop={}) returned {}'.format(filter_desktop, json.dumps(winjsonarr, indent=4)))
         return winjsonarr
-		
+
     def get_window_title(self, window=None, traverse=True) -> str:
         return self.get_window_info(window, traverse).wm_title
 
     def get_window_class(self, window=None, traverse=True) -> str:
         return self.get_window_info(window, traverse).wm_class
-    
+
     def _get_window_info(self, window, traverse: bool, wm_title: str=None, wm_class: str=None) -> WindowInfo:
         new_wm_title = self._try_get_window_title(window)
         new_wm_class = self._try_get_window_class(window)
@@ -310,6 +312,13 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
         self.lastChars = [] # QT4 Workaround
         self.__enableQT4Workaround = False # QT4 Workaround
         self.shutdown = False
+        # Guards every round-trip request/reply exchange on self.localDisplay.
+        # python-xlib's request/reply sequence-number bookkeeping is not
+        # thread-safe, and this connection is shared by eventThread
+        # (__eventLoop), listenerThread (__flush_events), and whichever
+        # thread calls public methods like mouse_location() directly (e.g.
+        # the scripting API). Must exist before either thread starts.
+        self.xlib_lock = threading.Lock()
 
         # Event loop
         self.eventThread = threading.Thread(target=self.__eventLoop)
@@ -367,9 +376,9 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
     @queue_method(queue)
     def press_key(self, keyName):
         """
-        Press passed keyName. 
+        Press passed keyName.
 
-        :param keyName: 
+        :param keyName:
         """
         self.__sendKeyPressEvent(self.__lookupKeyCode(keyName), 0)
 
@@ -559,15 +568,17 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
         :return: Tuple of the Mouse Location(x,y)
         :rtype: tuple
         """
-        pos = self.rootWindow.query_pointer()
-        return (pos.root_x, pos.root_y)
+        with self.xlib_lock:
+            pos = self.rootWindow.query_pointer()
+            return (pos.root_x, pos.root_y)
 
     def relative_mouse_location(self, window=None):
         #return relative mouse location within given window
-        if window==None:
-            window = self.localDisplay.get_input_focus().focus
-        pos = window.query_pointer()
-        return (pos.win_x, pos.win_y)
+        with self.xlib_lock:
+            if window==None:
+                window = self.localDisplay.get_input_focus().focus
+            pos = window.query_pointer()
+            return (pos.win_x, pos.win_y)
 
     def scroll_down(self, number):
         for i in range(0, number):
@@ -662,7 +673,12 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
             elif method is not None and args is None:
                 logger.debug("__eventLoop: Got method {} with None arguments!".format(method))
             try:
-                method(*args)
+                # Every queued method eventually round-trips on
+                # self.localDisplay; serialize against listenerThread and
+                # any thread calling public methods (e.g. mouse_location())
+                # directly. See the note on self.xlib_lock in __init__.
+                with self.xlib_lock:
+                    method(*args)
             except Exception as e:
                 logger.exception("Error in X event loop thread: {}".format(e))
 
@@ -1169,68 +1185,73 @@ class XInterfaceBase(threading.Thread, AbstractMouseInterface):
         logger.debug("Left event loop.")
 
     def __flush_events(self):
+        # select() just waits on the raw socket fd; it doesn't touch
+        # python-xlib's request/reply bookkeeping, so it stays outside the
+        # lock (holding it here would block eventThread/scripting calls for
+        # up to the full 1s timeout on every idle iteration).
         readable, _, _ = select.select([self.localDisplay], [], [], 1)
         if self.localDisplay in readable:
             createdWindows = []
             destroyedWindows = []
 
-            for _ in range(self.localDisplay.pending_events()):
-                event = self.localDisplay.next_event()
-                if event.type == X.CreateNotify:
-                    createdWindows.append(event.window)
-                if event.type == X.DestroyNotify:
-                    destroyedWindows.append(event.window)
-                if event.type == X.MappingNotify:
-                    logger.debug("X Mapping Event Detected")
-                    self.on_keys_changed()
-                if event.type == X.KeyPress or event.type == X.KeyRelease:
-                    keyCode = event.detail
-                    rawKey = self.lookup_string(keyCode, False, False, False)
+            with self.xlib_lock:
+                for _ in range(self.localDisplay.pending_events()):
+                    event = self.localDisplay.next_event()
+                    if event.type == X.CreateNotify:
+                        createdWindows.append(event.window)
+                    if event.type == X.DestroyNotify:
+                        destroyedWindows.append(event.window)
+                    if event.type == X.MappingNotify:
+                        logger.debug("X Mapping Event Detected")
+                        self.on_keys_changed()
+                    if event.type == X.KeyPress or event.type == X.KeyRelease:
+                        keyCode = event.detail
+                        rawKey = self.lookup_string(keyCode, False, False, False)
 
-                    logLevel = logging.DEBUG
-                    if logger.isEnabledFor(logLevel):
-                        # Only do all this extra work when we actually need it
-                        action = event.__class__.__name__
-                        keySym = self.localDisplay.keycode_to_keysym(keyCode, 0)
-                        shifted = bool(event.state & self.modMasks[Key.SHIFT]) ^ bool(event.state & self.modMasks[Key.CAPSLOCK])
-                        numlock = bool(event.state & self.modMasks[Key.NUMLOCK])
-                        altGrid = bool(event.state & self.modMasks[Key.ALT_GR])
-                        key = self.lookup_string(keyCode, shifted, numlock, altGrid)
-                        modifiers = [k.value for k, v in self.modMasks.items() if event.state & v]
-                        logger.log(logLevel, "Event type: {}, keyCode: {}, keySym: {}, key: {}, rawKey: {}, modifiers: {}".format(action, keyCode, keySym, key, rawKey, modifiers))
+                        logLevel = logging.DEBUG
+                        if logger.isEnabledFor(logLevel):
+                            # Only do all this extra work when we actually need it
+                            action = event.__class__.__name__
+                            keySym = self.localDisplay.keycode_to_keysym(keyCode, 0)
+                            shifted = bool(event.state & self.modMasks[Key.SHIFT]) ^ bool(event.state & self.modMasks[Key.CAPSLOCK])
+                            numlock = bool(event.state & self.modMasks[Key.NUMLOCK])
+                            altGrid = bool(event.state & self.modMasks[Key.ALT_GR])
+                            key = self.lookup_string(keyCode, shifted, numlock, altGrid)
+                            modifiers = [k.value for k, v in self.modMasks.items() if event.state & v]
+                            logger.log(logLevel, "Event type: {}, keyCode: {}, keySym: {}, key: {}, rawKey: {}, modifiers: {}".format(action, keyCode, keySym, key, rawKey, modifiers))
 
-                    if event.type == X.KeyRelease and rawKey in HELD_MODIFIERS:
-                        # If we let go of the modifier key while the hotkey is pressed,
-                        # the KeyRelease event for the modifier ends up here and is lost
-                        # to the application. This results in stuck modifier keys.
-                        # We rectify this problem by sending the KeyRelease event to the focused window.
+                        if event.type == X.KeyRelease and rawKey in HELD_MODIFIERS:
+                            # If we let go of the modifier key while the hotkey is pressed,
+                            # the KeyRelease event for the modifier ends up here and is lost
+                            # to the application. This results in stuck modifier keys.
+                            # We rectify this problem by sending the KeyRelease event to the focused window.
 
-                        logger.debug("Pass modifier key {} release event through to focused window".format(rawKey))
+                            logger.debug("Pass modifier key {} release event through to focused window".format(rawKey))
 
-                        focus = self.localDisplay.get_input_focus().focus
+                            focus = self.localDisplay.get_input_focus().focus
 
-                        new_event = event.KeyRelease(
-                            detail=event.detail,
-                            time=event.time,
-                            root=event.root,
-                            window=focus, # Note: event.window does not work here because X redirected the event to the window passed to the grab_key call
-                            child=event.child,
-                            root_x=event.root_x,
-                            root_y=event.root_y,
-                            event_x=event.event_x,
-                            event_y=event.event_y,
-                            state=event.state,
-                            same_screen=event.same_screen
-                        )
+                            new_event = event.KeyRelease(
+                                detail=event.detail,
+                                time=event.time,
+                                root=event.root,
+                                window=focus, # Note: event.window does not work here because X redirected the event to the window passed to the grab_key call
+                                child=event.child,
+                                root_x=event.root_x,
+                                root_y=event.root_y,
+                                event_x=event.event_x,
+                                event_y=event.event_y,
+                                state=event.state,
+                                same_screen=event.same_screen
+                            )
 
-                        self.localDisplay.send_event(
-                            destination=focus, # Note: event.window does not work here (see above)
-                            propagate=True,
-                            event_mask=X.KeyReleaseMask,
-                            event=new_event
-                        )
+                            self.localDisplay.send_event(
+                                destination=focus, # Note: event.window does not work here (see above)
+                                propagate=True,
+                                event_mask=X.KeyReleaseMask,
+                                event=new_event
+                            )
 
-                        self.localDisplay.flush()
+                            self.localDisplay.flush()
 
             for window in createdWindows:
                 if window not in destroyedWindows:
@@ -1446,7 +1467,7 @@ import autokey.configmanager.configmanager as cm
 XK.load_keysym_group('xkb')
 
 XK_TO_AK_MAP = {
-    
+
     # XK.XK_Shift_L: Key.SHIFT,
     XK.XK_Shift_L: Key.LEFTSHIFT,
     XK.XK_Shift_R: Key.RIGHTSHIFT,
@@ -1458,7 +1479,7 @@ XK_TO_AK_MAP = {
     # XK.XK_Alt_L: Key.ALT,
     XK.XK_Alt_L: Key.LEFTALT,
     XK.XK_Alt_R: Key.RIGHTALT,
-    
+
     # XK.XK_Super_L: Key.SUPER,
     XK.XK_Super_L: Key.LEFTSUPER,
     XK.XK_Super_R: Key.RIGHTSUPER,
